@@ -14,6 +14,7 @@ import anyio  # noqa: E402  (ships with the SDK)
 from mcp import Client  # noqa: E402
 
 from gitm.mcp_server import build_server, list_runs_data  # noqa: E402
+from gitm.optimizer.run_diff import DEFAULT_THRESHOLD  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 GOLDEN = REPO / "tests" / "golden" / "diff_gate" / "kimi-mi355x"
@@ -125,6 +126,22 @@ def test_diff_tool_rejects_thresholds_that_could_disable_the_gate(scratch, thres
                 {"run_a": "1111", "run_b": "2222", "threshold": threshold})
     assert res.is_error
     assert "threshold must be >= 0 and finite" in res.content[0].text
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_diff_tool_nonfinite_number_threshold_is_untransmittable_and_defaults(scratch, nonfinite):
+    """Standard JSON has no NaN/Infinity, so the SDK serializes a non-finite *number*
+    to null before it reaches the server (pydantic dumps nan/inf as null). The server
+    then cannot tell it from an omitted threshold and falls back to the default. The
+    gate stays safe: it still reports the regressions. A non-finite sent as a *string*
+    survives transport, is coerced, and is rejected (see the test above); the string
+    path is the one the shared diff_runs validation can actually see."""
+    res = _call(build_server(str(scratch)), "diff",
+                {"run_a": "1111", "run_b": "2222", "threshold": nonfinite})
+    assert not res.is_error
+    doc = res.structured_content
+    assert doc["threshold"] == DEFAULT_THRESHOLD
+    assert len(doc["regressions"]) == 2  # default-threshold regressions still caught
 
 
 @pytest.mark.parametrize("threshold,count", [(0.0, 2), (0.02, 2), (0.5, 0)])

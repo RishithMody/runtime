@@ -11,9 +11,17 @@
 **Arguments.** Each run can be a folder, a run id, or a unique id prefix under
 `$GITM_SCRATCH/runs`. `--json` emits the same dict the MCP tool returns. `--check` exits 1
 on a regression. Exit 2 means the runs can't be compared.
-`--threshold` must be finite and nonnegative; NaN, infinities, and negative values
-exit 2 without producing a diff, even with `--allow-empty`. MCP returns a tool error.
-Moves must strictly exceed the threshold. Decimal boundary ties are allowed a
+`--threshold` must be finite and nonnegative; `diff_runs` is the one place that enforces
+this, so CLI and MCP share it. On the **CLI**, NaN, infinities, and negative values exit 2
+without producing a diff, even with `--allow-empty`. Over **MCP** the rule is the same for
+every value JSON can carry: a negative number, or a non-finite sent as a *string*
+(`"nan"`, `"inf"`), is coerced to a float and returns a tool error. The one case the
+transport cannot deliver is a non-finite *number*: standard JSON has no NaN/Infinity, so the
+SDK serializes `nan`/`inf` to `null` before the request leaves the client. The server then
+cannot distinguish it from an omitted threshold and falls back to the default — it is never
+an error. This does not weaken the gate: the default still detects regressions, so a
+non-finite number can only make the gate stricter-or-equal, never silently pass. Moves must
+strictly exceed the threshold. Decimal boundary ties are allowed a
 machine-roundoff tolerance of one ULP from each input mean and the threshold;
 this is not an additional measurement noise band. Zero thresholds still detect
 any nonzero move, and reported moves are not rounded by this check.
