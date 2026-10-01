@@ -1,0 +1,167 @@
+{
+  "schema": 1,
+  "provenance": {
+    "workload_id": "vllm-decode",
+    "fingerprint": "rocm:3f9c1a7be2d40c55",
+    "run_id": "72724cccb9beab12d5fa59fcfb1556aa",
+    "git_sha": "737f0ca",
+    "gitm_version": "0.1.13"
+  },
+  "environment": {
+    "gpu_sku": "AMD Instinct MI355X",
+    "driver_cuda": null,
+    "torch_cuda": null
+  },
+  "protocol": {
+    "metric": "decode throughput (tokens/sec)",
+    "reps": "each side benchmarked `reps` times; std is the sample stdev",
+    "agreement_band": "relative band around our numbers within which a re-measurement agrees; floored at 2% because a single-rep A/B reports zero scatter",
+    "kept": "decided by the rollback gate (min_keep_delta), not by delta >= 0"
+  },
+  "results": [
+    {
+      "intervention_name": "enable_expert_parallel",
+      "summary": "enable_expert_parallel",
+      "knob": "enable_expert_parallel",
+      "value": true,
+      "source": "https://docs.vllm.ai/en/latest/configuration/engine_args.html",
+      "baseline_tps": 538.8,
+      "candidate_tps": 798.5015999999999,
+      "speedup": 1.482,
+      "delta": 0.482,
+      "baseline_std": 4.1,
+      "candidate_std": 4.4,
+      "reps": 3,
+      "agreement_band": 0.02,
+      "significant": true,
+      "kept": true,
+      "via": "restart",
+      "baseline_config": {
+        "model": "moonshotai/Kimi-K2.5",
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 256
+      },
+      "candidate_config": {
+        "model": "moonshotai/Kimi-K2.5",
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 256,
+        "enable_expert_parallel": true
+      }
+    },
+    {
+      "intervention_name": "enforce_eager",
+      "summary": "enforce_eager",
+      "knob": "enforce_eager",
+      "value": true,
+      "source": "https://docs.vllm.ai/en/latest/configuration/engine_args.html",
+      "baseline_tps": 538.8,
+      "candidate_tps": 487.614,
+      "speedup": 0.905,
+      "delta": -0.09499999999999997,
+      "baseline_std": 4.1,
+      "candidate_std": 4.4,
+      "reps": 3,
+      "agreement_band": 0.02,
+      "significant": true,
+      "kept": false,
+      "via": "restart",
+      "baseline_config": {
+        "model": "moonshotai/Kimi-K2.5",
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 256
+      },
+      "candidate_config": {
+        "model": "moonshotai/Kimi-K2.5",
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 256,
+        "enforce_eager": true
+      }
+    },
+    {
+      "intervention_name": "max_num_seqs_512",
+      "summary": "max_num_seqs_512",
+      "knob": "max_num_seqs",
+      "value": 512,
+      "source": "https://docs.vllm.ai/en/latest/configuration/engine_args.html",
+      "baseline_tps": 538.8,
+      "candidate_tps": 552.2699999999999,
+      "speedup": 1.025,
+      "delta": 0.02499999999999991,
+      "baseline_std": 4.1,
+      "candidate_std": 4.4,
+      "reps": 3,
+      "agreement_band": 0.02,
+      "significant": false,
+      "kept": true,
+      "via": "restart",
+      "baseline_config": {
+        "model": "moonshotai/Kimi-K2.5",
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 256
+      },
+      "candidate_config": {
+        "model": "moonshotai/Kimi-K2.5",
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 512
+      }
+    },
+    {
+      "intervention_name": "kv_cache_dtype_fp8",
+      "summary": "kv_cache_dtype_fp8",
+      "knob": "kv_cache_dtype",
+      "value": "fp8",
+      "source": "https://docs.vllm.ai/en/latest/configuration/engine_args.html",
+      "baseline_tps": 538.8,
+      "candidate_tps": 587.292,
+      "speedup": 1.09,
+      "delta": 0.09000000000000008,
+      "baseline_std": 4.1,
+      "candidate_std": 4.4,
+      "reps": 3,
+      "agreement_band": 0.02,
+      "significant": true,
+      "kept": true,
+      "via": "restart",
+      "baseline_config": {
+        "model": "moonshotai/Kimi-K2.5",
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 256
+      },
+      "candidate_config": {
+        "model": "moonshotai/Kimi-K2.5",
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 256,
+        "kv_cache_dtype": "fp8"
+      }
+    },
+    {
+      "intervention_name": "mla_triton_backend",
+      "summary": "mla_triton_backend",
+      "knob": "attention_backend",
+      "value": "TRITON_MLA",
+      "source": "https://docs.vllm.ai/en/latest/configuration/engine_args.html",
+      "baseline_tps": 538.8,
+      "candidate_tps": 570.0504,
+      "speedup": 1.058,
+      "delta": 0.05800000000000005,
+      "baseline_std": 4.1,
+      "candidate_std": 4.4,
+      "reps": 3,
+      "agreement_band": 0.02,
+      "significant": true,
+      "kept": true,
+      "via": "restart",
+      "baseline_config": {
+        "model": "moonshotai/Kimi-K2.5",
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 256
+      },
+      "candidate_config": {
+        "model": "moonshotai/Kimi-K2.5",
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 256,
+        "attention_backend": "TRITON_MLA"
+      }
+    }
+  ]
+}
