@@ -382,3 +382,71 @@ def test_cli_exact_id_wins_over_a_longer_run_id(tmp_path, capsys):
     assert Path(doc["a"]["run_dir"]).name == "abc"
     assert Path(doc["b"]["run_dir"]).name == "abcdef"
     assert len(doc["regressions"]) == 2
+
+
+# ── resolving a run by the recorded id the table prints (Greptile finding 1) ──
+
+
+def _run_with_id(runs: Path, folder: str, run_id: str) -> Path:
+    """Write a real-shaped run under ``folder`` whose recorded run_id is ``run_id``,
+    through the canonical writer — folder name and recorded id are independent."""
+    src = read_run(GOLDEN)
+    rec = VerificationRecord(**src.results[0])
+    prov = Provenance(workload_id=src.workload_id, fingerprint=src.fingerprint,
+                      run_id=run_id, git_sha="t", gitm_version="t",
+                      started_at_ns=0, ended_at_ns=1)
+    dest = runs / folder
+    write_verification([rec], prov, dest / "verification.json", gpu_sku=src.gpu_sku)
+    return dest
+
+
+def test_a_recorded_id_resolves_even_when_the_folder_name_differs(tmp_path):
+    run = _run_with_id(tmp_path, "folder-not-the-id", "1b72a23d937d6f763ae3650a388318fc")
+    assert read_run(run).run_id != run.name                       # the gap exists
+    assert resolve_run("1b72a23d937d6f763ae3650a388318fc", tmp_path) == run  # exact id
+    assert resolve_run("1b72a23d", tmp_path) == run               # unique id prefix
+
+
+def test_an_ambiguous_recorded_id_prefix_fails_closed(tmp_path):
+    a = _run_with_id(tmp_path, "first", "cafe0001deadbeef")
+    b = _run_with_id(tmp_path, "second", "cafe0002deadbeef")
+    assert resolve_run("cafe0001deadbeef", tmp_path) == a         # exact still resolves
+    assert resolve_run("cafe0002deadbeef", tmp_path) == b
+    with pytest.raises(UnreadableRun, match="cafe000.*recorded id of 2 runs.*give more of the id"):
+        resolve_run("cafe000", tmp_path)
+
+
+def test_an_exact_folder_name_beats_a_recorded_id(tmp_path):
+    """A folder literally named like another run's id resolves to the folder."""
+    named = tmp_path / "shared"
+    named.mkdir()
+    other = _run_with_id(tmp_path, "other", "shared")
+    assert resolve_run("shared", tmp_path) == named               # folder name wins
+    assert resolve_run("other", tmp_path) == other
+
+
+def test_a_damaged_run_is_not_matched_by_recorded_id(tmp_path):
+    good = _run_with_id(tmp_path, "good", "beef0001")
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "verification.json").write_text('{"results": [', encoding="utf-8")
+    assert resolve_run("beef0001", tmp_path) == good              # the sound run resolves
+    with pytest.raises(UnreadableRun, match="no run folder"):      # damage is never a match
+        resolve_run("whatever-only-the-bad-run-could-be", tmp_path)
+
+
+def test_cli_round_trip_displayed_recorded_id_resolves(tmp_path, capsys):
+    """Greptile finding 1, end to end: the 8-char id the table prints is usable in diff."""
+    runs = tmp_path / "runs"
+    a = runs / "baseline"
+    b = runs / "candidate"
+    shutil.copytree(GOLDEN, a)
+    shutil.copytree(RUNS / "regressed", b)
+    # 1) diff by path; read the recorded id the table/JSON shows for run b.
+    rc, out = _cli(capsys, a, b, "--json")
+    assert rc == 0
+    recorded = json.loads(out.out)["b"]["run_id"]
+    assert recorded != b.name                                     # folder != recorded id
+    # 2) paste the displayed 8-char id back as the run reference (previously failed).
+    rc2, out2 = _cli(capsys, a, recorded[:8], "--scratch", str(tmp_path), "--check")
+    assert rc2 == 1                                               # resolved and regressed
+    assert "REGRESSED" in out2.out

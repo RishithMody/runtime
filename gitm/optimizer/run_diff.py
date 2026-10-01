@@ -292,24 +292,67 @@ def render_diff(diff: RunDiff, *, show_unchanged: bool = False) -> str:
 
 
 def resolve_run(ref: str, runs_dir: Path) -> Path:
-    """A run folder from a path, a run id, or a unique run-id prefix.
+    """A run folder from a path, a run id, or a unique prefix of either.
 
-    Prefixes because the table prints eight characters of the id, and that is
-    what a person will paste back.
+    The diff table prints the export's recorded ``run_id``, which in production is
+    the folder name but need not be (an imported run, a renamed folder, the
+    ``run_id`` fallback). So the id a person reads off the table is resolved here
+    too, not only the directory name. Resolution is deterministic, in this
+    precedence order:
+
+    1. an existing path (``ref`` is itself a run directory);
+    2. an exact run-folder name;
+    3. an exact recorded ``run_id``;
+    4. a unique run-folder-name prefix;
+    5. a unique recorded ``run_id`` prefix, used only when no folder name matched.
+
+    Exact always beats a prefix, and a folder name beats a recorded id at equal
+    strength — so a complete id is never made ambiguous by a longer one, and the
+    earlier folder-only behaviour is unchanged. Recorded ids are read back through
+    :func:`~gitm.optimizer.history.read_run`, the one canonical reader (no second
+    parser of ``verification.json``); a run whose export is unreadable is skipped
+    when matching by id, never silently taken as a match. An ambiguous prefix
+    fails closed.
     """
     p = Path(ref).expanduser()
     if p.is_dir():
         return p
     if runs_dir.is_dir():
         runs = sorted(d for d in runs_dir.iterdir() if d.is_dir())
-        # A complete ID must not become ambiguous when a longer ID shares it.
+        # (2) exact folder name — a complete name is not made ambiguous by a
+        # longer one that shares it.
         for d in runs:
             if d.name == ref:
                 return d
+        # Recorded ids, read once through the canonical reader. A damaged or
+        # export-less run cannot be trusted to name itself, so it is skipped.
+        ids: list[tuple[Path, str]] = []
+        for d in runs:
+            try:
+                ids.append((d, read_run(d).run_id))
+            except UnreadableRun:
+                continue
+        # (3) exact recorded run_id.
+        exact = [d for d, rid in ids if rid == ref]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise UnreadableRun(
+                f"{ref!r} is the recorded id of {len(exact)} runs under {runs_dir}; "
+                f"pass a run directory")
+        # (4) unique folder-name prefix (unchanged behaviour and message).
         hits = [d for d in runs if d.name.startswith(ref)]
         if len(hits) == 1:
             return hits[0]
         if len(hits) > 1:
             raise UnreadableRun(
                 f"{ref!r} matches {len(hits)} runs under {runs_dir}; give more of the id")
+        # (5) unique recorded run_id prefix — only reached when no folder matched.
+        id_hits = [d for d, rid in ids if rid.startswith(ref)]
+        if len(id_hits) == 1:
+            return id_hits[0]
+        if len(id_hits) > 1:
+            raise UnreadableRun(
+                f"{ref!r} matches the recorded id of {len(id_hits)} runs under "
+                f"{runs_dir}; give more of the id")
     raise UnreadableRun(f"no run folder {ref!r} (not a path, nor a run id under {runs_dir})")

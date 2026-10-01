@@ -24,7 +24,9 @@ non-finite number can only make the gate stricter-or-equal, never silently pass.
 strictly exceed the threshold. Decimal boundary ties are allowed a
 machine-roundoff tolerance of one ULP from each input mean and the threshold;
 this is not an additional measurement noise band. Zero thresholds still detect
-any nonzero move, and reported moves are not rounded by this check.
+any nonzero move, and reported moves are not rounded by this check. A positive
+threshold below the floating-point spacing of the compared means is not
+meaningful: a move of about one ULP of the inputs may be treated as roundoff.
 
 **Preconditions.** The runs must be on the same GPU SKU and the same workload fingerprint.
 For two runs with exports, both identities must be nonempty and match.
