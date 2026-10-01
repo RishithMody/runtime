@@ -17,15 +17,21 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 __all__ = [
     "LeverRecord",
+    "NoExport",
+    "RunExport",
+    "UnreadableRun",
+    "aggregate",
     "runs_with_results",
     "History",
+    "history_as_dict",
     "load_history",
+    "read_run",
     "record_for",
     "render_history",
 ]
@@ -162,6 +168,148 @@ def runs_with_results(runs_dir: str | Path) -> int:
     return sum(1 for p in runs_dir.iterdir() if p.is_dir() and (p / EXPORT_NAME).exists())
 
 
+class UnreadableRun(ValueError):
+    """A run folder whose export could not be read; ``str(exc)`` is the reason.
+
+    The reason strings are the ones :attr:`History.skipped` has always carried,
+    so a caller reading one run (``gitm diff``) and a caller reading all of them
+    (``gitm history``) report the same failure in the same words.
+    """
+
+
+class NoExport(UnreadableRun):
+    """The run folder exists but never wrote an export.
+
+    Split out because it is the one unreadable case that is not damage: a run
+    with no live engine attached measures nothing and writes no export by design
+    (``scheduler/loop.py`` writes one only when an A/B produced results). A caller
+    may reasonably accept "measured nothing" while still refusing "truncated".
+    """
+
+
+@dataclass(frozen=True)
+class RunExport:
+    """One run's export, validated and with its identity fields pulled out."""
+
+    run_dir: Path
+    run_id: str
+    gpu_sku: str | None
+    fingerprint: str | None
+    workload_id: str | None
+    mtime: float
+    results: list[dict[str, Any]]
+
+
+def read_run(run_dir: str | Path) -> RunExport:
+    """Read and validate one run folder's ``verification.json``.
+
+    Raises :class:`NoExport` when the folder has no export and
+    :class:`UnreadableRun` when the export is there but cannot be trusted. Every
+    check that decides whether a run counts lives here, so :func:`load_history`
+    and a single-run reader cannot drift apart on what "readable" means.
+    """
+    d = Path(run_dir)
+    if not d.is_dir():
+        raise UnreadableRun("run dir does not exist")
+    path = d / EXPORT_NAME
+    if not path.exists():
+        raise NoExport(f"no {EXPORT_NAME}")
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UnreadableRun(f"unreadable: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise UnreadableRun("not a JSON object")
+    results = doc.get("results")
+    if not isinstance(results, list):
+        raise UnreadableRun("no results array")
+    env = doc.get("environment")
+    if env is not None and not isinstance(env, dict):
+        # Not tolerated the way a bad provenance is: run_id has a documented
+        # fallback and the SKU has none, and a record keyed under the wrong
+        # GPU is the one mistake this key exists to prevent.
+        raise UnreadableRun("malformed environment")
+    if not all(isinstance(r, dict) for r in results):
+        # Reading the sound entries and dropping the rest would under-count
+        # attempts with nothing saying so, which is what skipped is for.
+        raise UnreadableRun("malformed result entry")
+    if not all(_named(r.get("intervention_name")) for r in results):
+        raise UnreadableRun("malformed intervention name")
+    prov = doc.get("provenance") if isinstance(doc.get("provenance"), dict) else {}
+    sku = (env or {}).get("gpu_sku")
+    fp = prov.get("fingerprint")
+    # Both are keys and neither has a fallback: a record filed under the wrong
+    # box or the wrong model is the mistake the key exists to prevent, so a
+    # malformed one skips the run rather than keying under None.
+    if not _named(sku):
+        raise UnreadableRun("malformed gpu_sku")
+    if not _named(fp):
+        raise UnreadableRun("malformed fingerprint")
+    # run_id is the one identity field with a documented fallback, so a
+    # malformed one costs the run nothing. workload_id is display-only.
+    raw_run_id = prov.get("run_id")
+    run_id = raw_run_id if isinstance(raw_run_id, str) and raw_run_id else d.name
+    workload_id = prov.get("workload_id")
+    return RunExport(
+        run_dir=d,
+        run_id=run_id,
+        gpu_sku=sku,
+        fingerprint=fp,
+        workload_id=workload_id if isinstance(workload_id, str) else None,
+        mtime=path.stat().st_mtime,
+        results=results,
+    )
+
+
+def aggregate(
+    exports: list[RunExport],
+) -> dict[tuple[str, str | None, str | None], LeverRecord]:
+    """Fold exports into one :class:`LeverRecord` per (lever, gpu, workload).
+
+    ``exports`` must already be in run order: ``last_run_id`` is whichever run
+    came last in the list. Given a single export this is that run's own per-lever
+    record, which is what ``gitm diff`` compares.
+    """
+    acc: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
+    for e in exports:
+        for r in e.results:
+            name = r.get("intervention_name")
+            if not name:
+                continue
+            key = (name, e.gpu_sku, e.fingerprint)
+            a = acc.setdefault(
+                key,
+                {"runs": set(), "attempts": 0, "win": 0, "loss": 0,
+                 "inconclusive": 0, "deltas": [], "last_run_id": None},
+            )
+            a["runs"].add(e.run_id)
+            a["attempts"] += 1
+            a[_verdict(r)] += 1
+            delta = _delta_of(r)
+            if delta is not None:
+                a["deltas"].append(delta)
+            a["last_run_id"] = e.run_id
+
+    records = {}
+    for (name, sku, fp), a in acc.items():
+        deltas = a["deltas"]
+        records[(name, sku, fp)] = LeverRecord(
+            intervention_name=name,
+            gpu_sku=sku,
+            fingerprint=fp,
+            runs=len(a["runs"]),
+            attempts=a["attempts"],
+            wins=a["win"],
+            losses=a["loss"],
+            inconclusive=a["inconclusive"],
+            mean_delta=(sum(deltas) / len(deltas)) if deltas else None,
+            best_delta=max(deltas) if deltas else None,
+            worst_delta=min(deltas) if deltas else None,
+            last_run_id=a["last_run_id"],
+        )
+    return records
+
+
 def load_history(
     runs_dir: str | Path, *, gpu_sku: str | None = None,
     fingerprint: str | None = None,
@@ -181,107 +329,39 @@ def load_history(
     if not runs_dir.is_dir():
         return History(skipped={str(runs_dir): "runs dir does not exist"})
 
-    exports: list[tuple[float, str, str | None, str | None, list[dict[str, Any]]]] = []
+    exports: list[RunExport] = []
     for d in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
-        path = d / EXPORT_NAME
-        if not path.exists():
-            skipped[d.name] = f"no {EXPORT_NAME}"
-            continue
+        # Shape is checked (in read_run) before the GPU filter so that
+        # "filtered" only ever means a sound export from another box, never a
+        # damaged one that was never really read.
         try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            skipped[d.name] = f"unreadable: {exc}"
+            export = read_run(d)
+        except UnreadableRun as exc:
+            skipped[d.name] = str(exc)
             continue
-        if not isinstance(doc, dict):
-            skipped[d.name] = "not a JSON object"
-            continue
-        results = doc.get("results")
-        if not isinstance(results, list):
-            skipped[d.name] = "no results array"
-            continue
-        # Shape is checked before the GPU filter so that "filtered" only ever
-        # means a sound export from another box, never a damaged one that was
-        # never really read.
-        env = doc.get("environment")
-        if env is not None and not isinstance(env, dict):
-            # Not tolerated the way a bad provenance is: run_id has a documented
-            # fallback and the SKU has none, and a record keyed under the wrong
-            # GPU is the one mistake this key exists to prevent.
-            skipped[d.name] = "malformed environment"
-            continue
-        if not all(isinstance(r, dict) for r in results):
-            # Reading the sound entries and dropping the rest would under-count
-            # attempts with nothing saying so, which is what skipped is for.
-            skipped[d.name] = "malformed result entry"
-            continue
-        if not all(_named(r.get("intervention_name")) for r in results):
-            skipped[d.name] = "malformed intervention name"
-            continue
-        prov = doc.get("provenance") if isinstance(doc.get("provenance"), dict) else {}
-        sku = (env or {}).get("gpu_sku")
-        fp = prov.get("fingerprint")
-        # Both are keys and neither has a fallback: a record filed under the wrong
-        # box or the wrong model is the mistake the key exists to prevent, so a
-        # malformed one skips the run rather than keying under None.
-        if not _named(sku):
-            skipped[d.name] = "malformed gpu_sku"
-            continue
-        if not _named(fp):
-            skipped[d.name] = "malformed fingerprint"
-            continue
-        if (gpu_sku is not None and sku != gpu_sku) or (
-            fingerprint is not None and fp != fingerprint
+        if (gpu_sku is not None and export.gpu_sku != gpu_sku) or (
+            fingerprint is not None and export.fingerprint != fingerprint
         ):
             filtered += 1
             continue
-        # run_id is the one identity field with a documented fallback, so a
-        # malformed one costs the run nothing.
-        raw_run_id = prov.get("run_id")
-        run_id = raw_run_id if isinstance(raw_run_id, str) and raw_run_id else d.name
-        exports.append((path.stat().st_mtime, run_id, sku, fp, results))
+        exports.append(export)
 
-    exports.sort(key=lambda e: e[0])
+    exports.sort(key=lambda e: e.mtime)
+    return History(records=aggregate(exports), runs_read=len(exports),
+                   skipped=skipped, filtered=filtered)
 
-    acc: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
-    for _mtime, run_id, sku, fp, results in exports:
-        for r in results:
-            name = r.get("intervention_name")
-            if not name:
-                continue
-            key = (name, sku, fp)
-            a = acc.setdefault(
-                key,
-                {"runs": set(), "attempts": 0, "win": 0, "loss": 0,
-                 "inconclusive": 0, "deltas": [], "last_run_id": None},
-            )
-            a["runs"].add(run_id)
-            a["attempts"] += 1
-            a[_verdict(r)] += 1
-            delta = _delta_of(r)
-            if delta is not None:
-                a["deltas"].append(delta)
-            a["last_run_id"] = run_id
 
-    records = {}
-    for (name, sku, fp), a in acc.items():
-        deltas = a["deltas"]
-        records[(name, sku, fp)] = LeverRecord(
-            intervention_name=name,
-            gpu_sku=sku,
-            fingerprint=fp,
-            runs=len(a["runs"]),
-            attempts=a["attempts"],
-            wins=a["win"],
-            losses=a["loss"],
-            inconclusive=a["inconclusive"],
-            mean_delta=(sum(deltas) / len(deltas)) if deltas else None,
-            best_delta=max(deltas) if deltas else None,
-            worst_delta=min(deltas) if deltas else None,
-            last_run_id=a["last_run_id"],
-        )
-
-    return History(records=records, runs_read=len(exports), skipped=skipped,
-                   filtered=filtered)
+def history_as_dict(history: History) -> dict[str, Any]:
+    """The JSON shape of ``gitm history --json``, shared with the MCP tool."""
+    return {
+        "runs_read": history.runs_read,
+        "filtered": history.filtered,
+        "skipped": history.skipped,
+        "records": [
+            {**asdict(r), "conflicted": r.conflicted}
+            for r in history.records.values()
+        ],
+    }
 
 
 def record_for(

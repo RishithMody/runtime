@@ -190,6 +190,55 @@ def _parser() -> argparse.ArgumentParser:
     hist.add_argument("--top", type=int, default=20, help="Rows to show (default 20).")
     hist.add_argument("--json", action="store_true", help="Emit the records as JSON.")
 
+    diff = sub.add_parser(
+        "diff",
+        help="What moved between two runs, per lever.",
+        description=(
+            "Compare two runs' verification.json lever by lever: tried in one but not "
+            "the other, kept in one and rolled back in the other, or measured delta "
+            "moving by more than --threshold. Both runs must be on the same GPU SKU "
+            "and workload fingerprint. Read-only, like `gitm history`."
+        ),
+        epilog=(
+            "Exit status: 0 compared; 1 a kept lever regressed (with --check); "
+            "2 the runs cannot be compared (different GPU/workload, a damaged export, "
+            "or a run that measured nothing without --allow-empty)."
+        ),
+    )
+    diff.add_argument("run_a", help="Baseline run: a run folder, run id, or unique id prefix.")
+    diff.add_argument("run_b", help="Run to compare against it (same forms).")
+    diff.add_argument(
+        "--scratch",
+        default=None,
+        help="Where run ids resolve (default $GITM_SCRATCH/runs). Paths ignore this.",
+    )
+    diff.add_argument(
+        "--threshold", type=float, default=None,
+        help="Finite, nonnegative delta threshold, in delta points (0.02 = 2 pts, the "
+             "export's own noise floor, which is the default).",
+    )
+    diff.add_argument("--check", action="store_true",
+                      help="Exit 1 if any lever kept in run A regressed in run B.")
+    diff.add_argument(
+        "--allow-empty", action="store_true",
+        help="Accept a skipped comparison when an export is absent (no engine attached) "
+             "instead of exiting 2. Does not override identity checks for measured runs.",
+    )
+    diff.add_argument("--all", dest="show_unchanged", action="store_true",
+                      help="List unchanged levers as rows too.")
+    diff.add_argument("--json", action="store_true", help="Emit the diff as JSON.")
+
+    mcp = sub.add_parser(
+        "mcp",
+        help="Serve `history` and `diff` as MCP tools over stdio.",
+        description="Needs the MCP SDK: pip install 'gitm-labs[mcp]'.",
+    )
+    mcp.add_argument(
+        "--scratch",
+        default=None,
+        help="Override $GITM_SCRATCH for every tool call this server answers.",
+    )
+
     add_plan_arguments(sub.add_parser(
         "plan",
         help="Predicted roofline floor for a checkpoint — no GPU, no server needed.",
@@ -401,6 +450,46 @@ def _run_capture(args, serve_argv: list[str] | None) -> int:
     return rc
 
 
+def _cmd_diff(args: Any) -> int:
+    """``gitm diff``. Exit codes are the gate's contract; see the parser epilog."""
+    from gitm._paths import runs_dir
+    from gitm.optimizer.history import UnreadableRun
+    from gitm.optimizer.run_diff import (
+        DEFAULT_THRESHOLD,
+        diff_as_dict,
+        diff_runs,
+        render_diff,
+        resolve_run,
+    )
+
+    threshold = DEFAULT_THRESHOLD if args.threshold is None else args.threshold
+    try:
+        rd = runs_dir(args.scratch)
+        d = diff_runs(resolve_run(args.run_a, rd), resolve_run(args.run_b, rd),
+                      threshold=threshold)
+    except (UnreadableRun, ValueError) as exc:
+        print(f"gitm diff: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(diff_as_dict(d), indent=2))
+    else:
+        print(render_diff(d, show_unchanged=args.show_unchanged))
+    if not (d.a.measured and d.b.measured):
+        # CI may accept a skipped comparison, but never call it comparable.
+        if args.allow_empty:
+            return 0
+        empty = "a" if not d.a.measured else "b"
+        # Flush first: when both streams go to one file or pipe, stdout is
+        # block-buffered, and the refusal otherwise lands above the table it refers to.
+        sys.stdout.flush()
+        print(f"gitm diff: run {empty} measured nothing; pass --allow-empty to accept that",
+              file=sys.stderr)
+        return 2
+    if not d.comparable:
+        return 2
+    return 1 if args.check and d.regressions else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
 
@@ -545,25 +634,23 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "history":
-        from dataclasses import asdict
-
         from gitm._paths import runs_dir
-        from gitm.optimizer.history import load_history, render_history
+        from gitm.optimizer.history import history_as_dict, load_history, render_history
 
         history = load_history(runs_dir(args.scratch), gpu_sku=args.gpu)
         if args.json:
-            print(json.dumps({
-                "runs_read": history.runs_read,
-                "filtered": history.filtered,
-                "skipped": history.skipped,
-                "records": [
-                    {**asdict(r), "conflicted": r.conflicted}
-                    for r in history.records.values()
-                ],
-            }, indent=2))
+            print(json.dumps(history_as_dict(history), indent=2))
         else:
             print(render_history(history, top=args.top))
         return 0
+
+    if args.cmd == "diff":
+        return _cmd_diff(args)
+
+    if args.cmd == "mcp":
+        from gitm.mcp_server import main as mcp_main
+
+        return mcp_main(["--scratch", args.scratch] if args.scratch else [])
 
     if args.cmd == "analyze":
         from gitm.importers.analyze import analyze_paths

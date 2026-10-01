@@ -1,0 +1,100 @@
+name: Diff gate
+
+# Fails a PR when a lever the checked-in golden run kept has regressed by more than
+# the threshold in a run produced here: `gitm diff <golden> <ci-run> --check`.
+#
+# The runners have no GPU, so the CI-side run is what the loop produces with no engine
+# attached: status no_data and no verification.json (scheduler/loop.py writes one only
+# when a live A/B ran). `--allow-empty` makes that an explicit skipped comparison rather
+# than an error. Drop it once this job runs on a GPU runner, so a run that silently
+# measured nothing fails instead.
+#
+# Because the CI run cannot regress, the first step proves the gate can still fail: a
+# checked-in regressed fixture must make `--check` exit 1. Without that, a gate broken
+# into always-passing would look identical to a green one.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GOLDEN_RUN: tests/golden/diff_gate/kimi-mi355x
+  # Delta points (0.02 = 2 pts). Kept on the command line, not in an env default,
+  # so the log of every gate run states the threshold it gated at.
+  DIFF_THRESHOLD: "0.02"
+
+jobs:
+  diff-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package
+        run: |
+          python -m pip install -U pip
+          pip install -e .
+
+      - name: Gate self-check (a known regression must fail)
+        run: |
+          set +e
+          gitm diff "$GOLDEN_RUN" tests/fixtures/diff/runs/regressed \
+            --check --threshold "$DIFF_THRESHOLD"
+          rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "::error::gitm diff --check exited $rc on a known regression; expected 1"
+            exit 1
+          fi
+
+      - name: Produce a CI run (no engine attached)
+        run: |
+          scratch="$RUNNER_TEMP/gitm"
+          set +e
+          gitm run --workload vllm-decode --budget 30s --scratch "$scratch"
+          rc=$?
+          set -e
+          # 0 = measured, 3 = no_data (expected on a GPU-less runner). Anything
+          # else is the loop crashing, which the gate must not paper over.
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+            echo "::error::gitm run exited $rc"
+            exit "$rc"
+          fi
+          run_dir=$(find "$scratch/runs" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          test -n "$run_dir"
+          echo "CI_RUN=$run_dir" >> "$GITHUB_ENV"
+
+      - name: Diff golden vs CI run
+        run: |
+          set +e
+          gitm diff "$GOLDEN_RUN" "$CI_RUN" --threshold "$DIFF_THRESHOLD" --json > diff.json
+          gitm diff "$GOLDEN_RUN" "$CI_RUN" --threshold "$DIFF_THRESHOLD" \
+            --check --allow-empty --all | tee diff.txt
+          rc=${PIPESTATUS[0]}
+          {
+            echo '### gitm diff: golden vs this run'
+            echo '```'
+            cat diff.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Upload diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitm-diff
+          path: |
+            diff.json
+            diff.txt
+          if-no-files-found: ignore

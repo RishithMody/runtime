@@ -47,7 +47,11 @@ htmlcov/
 .DS_Store
 
 
-.claude
+# Agent config: local settings stay private, shared skills/settings are tracked
+# (AGENTS.md, CLAUDE.md, .mcp.json and .agents/skills -> .claude/skills).
+.claude/*
+!.claude/skills/
+!.claude/settings.json
 venv
 takehome
 
