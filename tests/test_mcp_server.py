@@ -116,3 +116,20 @@ def test_diff_tool_does_not_claim_comparison_without_identity(scratch, other):
     assert doc["preconditions"]["gpu_sku"] == "unverified"
     assert doc["levers"] == []
     assert doc["regressions"] == []
+
+
+@pytest.mark.parametrize("threshold", ["nan", "inf", "-inf", "1e309", -0.1])
+def test_diff_tool_rejects_thresholds_that_could_disable_the_gate(scratch, threshold):
+    """Strings are valid JSON and the SDK coerces them to the declared float type."""
+    res = _call(build_server(str(scratch)), "diff",
+                {"run_a": "1111", "run_b": "2222", "threshold": threshold})
+    assert res.is_error
+    assert "threshold must be >= 0 and finite" in res.content[0].text
+
+
+@pytest.mark.parametrize("threshold,count", [(0.0, 2), (0.02, 2), (0.5, 0)])
+def test_diff_tool_accepts_finite_nonnegative_thresholds(scratch, threshold, count):
+    res = _call(build_server(str(scratch)), "diff",
+                {"run_a": "1111", "run_b": "2222", "threshold": threshold})
+    assert not res.is_error
+    assert len(res.structured_content["regressions"]) == count

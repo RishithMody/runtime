@@ -11,6 +11,12 @@
 **Arguments.** Each run can be a folder, a run id, or a unique id prefix under
 `$GITM_SCRATCH/runs`. `--json` emits the same dict the MCP tool returns. `--check` exits 1
 on a regression. Exit 2 means the runs can't be compared.
+`--threshold` must be finite and nonnegative; NaN, infinities, and negative values
+exit 2 without producing a diff, even with `--allow-empty`. MCP returns a tool error.
+Moves must strictly exceed the threshold. Decimal boundary ties are allowed a
+machine-roundoff tolerance of one ULP from each input mean and the threshold;
+this is not an additional measurement noise band. Zero thresholds still detect
+any nonzero move, and reported moves are not rounded by this check.
 
 **Preconditions.** The runs must be on the same GPU SKU and the same workload fingerprint.
 For two runs with exports, both identities must be nonempty and match.

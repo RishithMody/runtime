@@ -113,6 +113,18 @@ def test_the_threshold_decides_what_counts():
         diff_runs(GOLDEN, RUNS / "rerun_noise", threshold=-0.1)
 
 
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), float("-inf"), -0.1])
+def test_invalid_threshold_is_rejected_before_reading_runs(tmp_path, threshold):
+    """Invalid configuration must fail even before an empty-run exception can apply."""
+    with pytest.raises(ValueError, match="threshold must be >= 0 and finite"):
+        diff_runs(tmp_path / "missing-a", tmp_path / "missing-b", threshold=threshold)
+
+
+@pytest.mark.parametrize("threshold,regressions", [(0.0, 2), (0.02, 2), (0.5, 0)])
+def test_finite_nonnegative_thresholds_still_gate_measured_regressions(threshold, regressions):
+    assert len(diff_runs(GOLDEN, RUNS / "regressed", threshold=threshold).regressions) == regressions
+
+
 @pytest.mark.parametrize("other,field", [("other_gpu", "gpu_sku"),
                                          ("other_workload", "fingerprint")])
 def test_different_box_or_workload_is_refused_not_footnoted(other, field):
@@ -304,3 +316,69 @@ def test_allow_empty_accepts_a_skip_without_claiming_comparison(capsys, side):
     assert doc["comparable"] is False
     assert doc["levers"] == []
     assert doc["regressions"] == []
+
+
+@pytest.mark.parametrize("threshold", ["nan", "inf", "-inf", "1e309", "-0.1"])
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("candidate", ["regressed", "no_export"])
+def test_cli_invalid_threshold_cannot_pass_the_gate(capsys, threshold, json_output, candidate):
+    flags = ["--json"] if json_output else []
+    rc, out = _cli(capsys, GOLDEN, RUNS / candidate, "--check", "--allow-empty",
+                   f"--threshold={threshold}", *flags)
+    assert rc == 2
+    assert out.out == ""
+    assert "threshold must be >= 0 and finite" in out.err
+
+
+@pytest.mark.parametrize("ref,expected", [("abc", "abc"), ("abcdef", "abcdef"),
+                                         ("abcd", "abcdef")])
+def test_exact_run_ids_take_precedence_and_unique_prefixes_still_work(tmp_path, ref, expected):
+    for name in ("abc", "abcdef"):
+        (tmp_path / name).mkdir()
+    assert resolve_run(ref, tmp_path) == tmp_path / expected
+
+
+def test_a_nonexact_shared_prefix_remains_ambiguous(tmp_path):
+    for name in ("abc", "abcdef"):
+        (tmp_path / name).mkdir()
+    with pytest.raises(UnreadableRun, match="'ab' matches 2 runs.*give more of the id"):
+        resolve_run("ab", tmp_path)
+
+
+def test_an_unknown_run_id_preserves_the_not_found_error(tmp_path):
+    (tmp_path / "abc").mkdir()
+    with pytest.raises(UnreadableRun, match="no run folder 'unknown'"):
+        resolve_run("unknown", tmp_path)
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_existing_paths_take_precedence_over_scratch_ids(tmp_path, monkeypatch, absolute):
+    """A relative directory in cwd must still win over the same ID under scratch."""
+    runs = tmp_path / "runs"
+    (runs / "abc").mkdir(parents=True)
+    (runs / "abcdef").mkdir()
+    local = tmp_path / "abc"
+    local.mkdir()
+    monkeypatch.chdir(tmp_path)
+    ref = str(local) if absolute else "abc"
+    assert resolve_run(ref, runs) == (local if absolute else Path("abc"))
+
+
+def test_exact_id_lookup_does_not_add_scratch_relative_path_resolution(tmp_path, monkeypatch):
+    """A slash-containing ref that is not an existing path is not a child run ID."""
+    runs = tmp_path / "runs"
+    (runs / "group" / "abc").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(UnreadableRun, match="no run folder"):
+        resolve_run("group/abc", runs)
+
+
+def test_cli_exact_id_wins_over_a_longer_run_id(tmp_path, capsys):
+    for name, src in (("abc", GOLDEN), ("abcdef", RUNS / "regressed")):
+        shutil.copytree(src, tmp_path / "runs" / name)
+    rc, out = _cli(capsys, "abc", "abcdef", "--scratch", tmp_path, "--check", "--json")
+    assert rc == 1
+    doc = json.loads(out.out)
+    assert Path(doc["a"]["run_dir"]).name == "abc"
+    assert Path(doc["b"]["run_dir"]).name == "abcdef"
+    assert len(doc["regressions"]) == 2

@@ -214,7 +214,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     diff.add_argument(
         "--threshold", type=float, default=None,
-        help="Smallest delta move that counts, in delta points (0.02 = 2 pts, the "
+        help="Finite, nonnegative delta threshold, in delta points (0.02 = 2 pts, the "
              "export's own noise floor, which is the default).",
     )
     diff.add_argument("--check", action="store_true",

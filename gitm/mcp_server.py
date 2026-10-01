@@ -82,7 +82,8 @@ Each lever has a `change`: verdict_changed (kept <-> rolled_back/mixed), delta_m
 delta moved by more than `threshold`), only_in_a / only_in_b (tried in one run only), or
 unchanged. `move` = b.mean_delta - a.mean_delta, in delta points. `regressed` is true only
 when run A kept the lever AND run B measured it more than `threshold` lower. A lever
-missing from B was not re-measured; that is not a regression. `threshold` defaults to
+missing from B was not re-measured; that is not a regression. `threshold` must be
+finite and nonnegative (NaN and infinities are errors), and defaults to
 {DEFAULT_THRESHOLD} (2 pts), the export's own noise floor. A side with measured=false has
 no verification.json: comparison is skipped, comparable=false, with no lever rows.
 An empty regressions list in a refused/skipped comparison is not evidence of no regression.

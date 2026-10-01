@@ -31,6 +31,7 @@ Three decisions are made here and nowhere else:
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -174,13 +175,23 @@ def _compare(name: str, a: LeverState | None, b: LeverState | None,
         b.mean_delta - a.mean_delta
         if a.mean_delta is not None and b.mean_delta is not None else None
     )
+    exceeds = False
+    if move is not None:
+        # Decimal ties can subtract slightly beyond the threshold. Allow only
+        # machine roundoff at the operands' scale, not a measurement noise band.
+        roundoff = (math.ulp(a.mean_delta) + math.ulp(b.mean_delta)
+                    + math.ulp(threshold))
+        exceeds = abs(move) > threshold and (
+            threshold == 0 or not math.isclose(abs(move), threshold,
+                                              rel_tol=0.0, abs_tol=roundoff)
+        )
     if a.verdict != b.verdict:
         change = VERDICT_CHANGED
-    elif move is not None and abs(move) > threshold:
+    elif exceeds:
         change = DELTA_MOVED
     else:
         change = UNCHANGED
-    regressed = a.verdict != "rolled_back" and move is not None and move < -threshold
+    regressed = a.verdict != "rolled_back" and exceeds and move < 0
     return LeverDiff(name, change, a, b, move=move, regressed=regressed)
 
 
@@ -193,8 +204,10 @@ def diff_runs(run_a: str | Path, run_b: str | Path, *,
     back as a side with ``measured=False``. Unknown or mismatched identity
     refuses the comparison with no lever rows, including when an export is absent.
     """
-    if threshold < 0:
-        raise ValueError(f"threshold must be >= 0, got {threshold}")
+    # NaN and infinity silently suppress regression comparisons and must not
+    # turn a misconfigured gate into a successful result, even for empty runs.
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError(f"threshold must be >= 0 and finite, got {threshold}")
     a, ea = _side(Path(run_a))
     b, eb = _side(Path(run_b))
     pre = {attr: _precondition(a, b, attr) for attr in ("gpu_sku", "fingerprint")}
@@ -288,7 +301,12 @@ def resolve_run(ref: str, runs_dir: Path) -> Path:
     if p.is_dir():
         return p
     if runs_dir.is_dir():
-        hits = sorted(d for d in runs_dir.iterdir() if d.is_dir() and d.name.startswith(ref))
+        runs = sorted(d for d in runs_dir.iterdir() if d.is_dir())
+        # A complete ID must not become ambiguous when a longer ID shares it.
+        for d in runs:
+            if d.name == ref:
+                return d
+        hits = [d for d in runs if d.name.startswith(ref)]
         if len(hits) == 1:
             return hits[0]
         if len(hits) > 1:
