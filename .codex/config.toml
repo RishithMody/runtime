@@ -1,0 +1,6 @@
+# Project-scoped Codex config: exposes `gitm mcp` (list_runs / history / diff).
+# Needs `gitm` on PATH with the mcp extra: pip install -e ".[mcp]".
+# If your Codex build ignores project config, copy this block into ~/.codex/config.toml.
+[mcp_servers.gitm]
+command = "gitm"
+args = ["mcp"]
