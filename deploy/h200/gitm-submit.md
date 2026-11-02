@@ -1,8 +1,8 @@
 # gitm-submit — target interface
 
 One script to run a traced job on the H200s over the Slurm REST API, from your
-laptop, no SSH. Sebastian gets his baseline and noise-floor series without
-learning Slurm; Pamela's run record keys on the run ID this script mints.
+laptop, no SSH. It produces the baseline and noise-floor series without
+requiring Slurm knowledge; the run record keys on the run ID this script mints.
 
 - **Spec:** [gitm-submit: H200 job submit script](https://linear.app/git-machine/document/gitm-submit-h200-job-submit-script-rishith-mody-c2704067f5bb) · **Owner:** Rishith · **Reviewer / merge gate:** Sebastian.
 - **Umbrella:** ENG-74. This doc is **ENG-75 (S1)** — the target interface, what already works, what changes, and the in-container command sequence. It describes the **v1 target**; where behavior isn't built yet it's marked **[v1]**.
@@ -37,23 +37,23 @@ The current `gitm-submit` already does all of this — v1 keeps it:
 | **Load** | synthetic (`--requests`/`--concurrency`) | a **traffic replay file** as input; synthetic is never generated when a replay file is given |
 | **Completion** | fire-and-forget (watch the page) | **block or poll** until the job ends |
 | **Model** | takes any `--model`, relies on cache/download | **resident-model check**; never downloads; fail + name the node that has it |
-| **Health** | none | **pre/post-run hook points** for Nathan's health check (he wires the check; we leave the hooks) |
+| **Health** | none | **pre/post-run hook points** for the node health check (hooks only; the check logic lands separately) |
 
 ## Target interface
 
-- **Inputs:** model; engine config (engine name + launch flags — vLLM now, SGLang when Collin's R1 lands); **traffic replay file**; trace output path; node (`gitmachine-1` | `gitmachine-2`).
+- **Inputs:** model; engine config (engine name + launch flags — vLLM now, SGLang when it lands); **traffic replay file**; trace output path; node (`gitmachine-1` | `gitmachine-2`).
 - **Behavior:** write the Slurm job → submit → **block or poll until done** → copy results and logs to `<results root>/<run id>/`.
 - **Output —** `<results root>/<run id>/`:
   - `trace/…` — the CUPTI kernel trace (multi-GB; may live on ephemeral scratch).
   - `engine.log` — the vLLM/SGLang server log.
   - `slurm.log` — the Slurm `%j.log`.
   - `inputs.json` — exact inputs: `run_id`, `slurm_job_id`, `submitter`, `node`, `model`, `hf_revision`, `engine`, `engine_version`, `engine_flags`, `replay_file`, timestamps, `status`.
-- **Resident-model rule (enforced by the script, not policy):** one model stays resident per node — **Kimi K2.6 → `gitmachine-2`**, **DeepSeek V4 Pro → `gitmachine-1`**. Jobs change **config only**; the script **never downloads weights**. *Resident = weights in the node's HF cache, not a live server* — every job launches its own engine in its own container (launch flags can't change on a running process). The check is exactly: `models--<org>--<name>` exists under `HF_CACHE` (from `/etc/gitm-gpu/config`; currently `/mnt/disks/scratch/hf_hub` on both nodes) on the target node — else fail and name the node that has it. Weights are downloaded **outside this script** (the queue lane).
+- **Resident-model rule (enforced by the script, not policy):** one model stays resident per node — **Kimi K2.6 → `gitmachine-2`**, **DeepSeek V4 Pro → `gitmachine-1`**. Jobs change **config only**; the script **never downloads weights**. *Resident = weights in the node's HF cache, not a live server* — every job launches its own engine in its own container (launch flags can't change on a running process). The check requires the **complete requested snapshot** under `HF_CACHE` (from `/etc/gitm-gpu/config`; currently `/mnt/disks/scratch/hf_hub` on both nodes) on the target node: the resolved revision's weight files, **not** merely a `models--<org>--<name>` directory, which can also hold a config-only or half-finished download. The engine is then launched **local-files-only**, so a check that passes cannot be followed by a download at startup. Otherwise fail and name the node that has it. Weights are downloaded **outside this script** (the queue lane).
 - **Run ID** is minted by the script (not the Slurm job id). It names the results directory and goes in the Slurm job comment; the Slurm job id is recorded in `inputs.json`.
 
 ## Run ID & results layout
 
-Agreed in **ENG-76** with Pamela and Sebastian:
+Agreed in **ENG-76**:
 
 ```
 <UTC>-<model-slug>-<node>-<rand4>
@@ -71,36 +71,42 @@ UTC-first (chronological sort, FS/Slurm-comment safe); `model-slug` from the HF 
 
 `/mnt/gitm-runs` is one config value (`RESULTS_ROOT`), repointable later without touching run ids or loop code. The `record.json` schema is **ENG-72**'s job. *The gcsfuse bucket/mount is a separate ops step (feeds ENG-77); until it exists, runs land on the per-node `/var/lib/gitm/results`.*
 
-## In-container command sequence — ⚠️ PROPOSED, pending Sebastian
-
-> The spec requires S1 to write "the exact in-container command sequence agreed
-> with Sebastian." Below is the proposal to confirm with him — he owns the
-> baseline/replay series. The building blocks exist on `main`; what needs his
-> sign-off is the exact wiring (window boundaries, how serve is told not to
-> self-drive, adapter + tokenizer choices).
+## In-container command sequence
 
 **Today (synthetic):** `gitm capture serve` serves vLLM under the collector and drives its own load — see above.
 
 **v1 (replay):** launch the engine under the collector, fire the replay file at it, capture that window. The replay machinery is `python -m gitm.traffic --replay <adapter> <file> --fire` (adapters on `main`: **`mooncake`**, **`burstgpt`**; it drives `vllm bench serve` against a running server — see [`docs/TrafficReplayDoc.md`](../../docs/TrafficReplayDoc.md)).
 
-**Proposed sequence (Option A — attach + observe window; recommended):**
+**Sequence — attach + observe window [v1]:**
 ```bash
-# 1. launch vLLM under the CUPTI collector, serving, in the background
-CUDA_INJECTION64_PATH=<cupti shim> \
-  vllm serve "$MODEL" --tensor-parallel-size 8 --trust-remote-code <engine flags> &
-# 2. wait for http://127.0.0.1:8000/health
-# 3. open a capture window in OBSERVE mode for the replay's duration
+# 1. collector env — BOTH vars, exported before vLLM initializes CUDA.
+#    `gitm.tracer.injection.run_env(<path>)` renders the exact pair (and the
+#    AMD equivalent); the driver reads these only at CUDA init.
+export CUDA_INJECTION64_PATH=<prefix>/libgitm_inject.so
+export GITM_TRACE_OUT=/out/trace/vllm.jsonl      # each process writes $GITM_TRACE_OUT.<pid>
+# 2. launch vLLM under the collector, serving, in the background
+vllm serve "$MODEL" --tensor-parallel-size 8 --trust-remote-code <engine flags> &
+# 3. wait for http://127.0.0.1:8000/health
+# 4. open a capture window in OBSERVE mode for the replay's duration
 gitm capture attach --port 8000 --out /out --duration <window_s> &
-# 4. fire the replay file at the running server
+CAP_PID=$!
+# 5. fire the replay file at the running server
 python -m gitm.traffic --replay <mooncake|burstgpt> <replay_file> --fire \
     --model "$MODEL" --base-url http://127.0.0.1:8000 --result-dir /out
-# 5. window closes → trace + bench-serve result land in /out
+# 6. wait for the window to close and the shards to merge before the job exits;
+#    a non-zero status here means no usable trace, so fail the run on it.
+wait "$CAP_PID"
 ```
 `gitm capture attach` observe-mode "watches the server's own traffic," so it captures exactly the replay window rather than synthetic load — which matches the spec. (`--tokenizer` is needed if the served model name isn't HF-resolvable.)
 
-**Option B (single command):** if `gitm capture serve` grows a replay input (serve drives the replay itself instead of `--requests`), the job is one command and no separate `attach` is needed. Not available on `main` today; flag for Sebastian whether to add it in S3 vs. use Option A.
-
-**To confirm with Sebastian (S1):** Option A vs B; the capture window length vs. replay duration; exact flag to suppress synthetic load; adapter + tokenizer defaults for the Kimi baseline series.
+Two things in step 1 are load-bearing. `GITM_TRACE_OUT` is the rendezvous, not a
+convenience: `attach` resolves the target's trace path from the server's own
+environ and adopts it, so a server started with `CUDA_INJECTION64_PATH` but no
+`GITM_TRACE_OUT` is classified **untraceable** — *"the collector has nowhere to
+write and is inert"* — and step 4 opens no window even when the replay succeeds.
+Both vars must also be exported *before* CUDA init, because the driver reads
+them once, when the engine is constructed; they cannot be added to a live
+server. `gitm capture attach --list` reports which servers qualify.
 
 ## CLI reference (today → v1)
 
@@ -113,7 +119,7 @@ python -m gitm.traffic --replay <mooncake|burstgpt> <replay_file> --fire \
 | `--wait` / poll-to-completion | **[v1]** | block or poll until the job ends |
 | run id + `inputs.json` under `<results root>/<run id>/` | **[v1]** | replaces bare `<jobid>/` |
 | resident-model check | **[v1]** | fail + name the node if weights absent; never downloads |
-| pre/post health hooks | **[v1]** | hook points only; Nathan wires the check |
+| pre/post health hooks | **[v1]** | hook points only; check logic lands separately |
 
 ## Not in scope
 
